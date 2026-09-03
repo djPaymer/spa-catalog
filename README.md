@@ -1,36 +1,28 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SPA Catalog
 
-## Getting Started
+Next.js-каталог производителей. Данные берёт из **td-catalog**, инструкции скрейпа и продукты — из **td-parser**.
 
-First, run the development server:
+## Запуск
 
 ```bash
+cp .env.example .env.local
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Откройте [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Переменные окружения
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Переменная | Назначение | Пример |
+|------------|------------|--------|
+| `TD_CATALOG_BASE_URL` | Базовый URL td-catalog | `https://dev.toolsdiscont.com/td-catalog` |
+| `TD_PARSER_BASE_URL` | Базовый URL td-parser | `http://127.0.0.1:8000` |
 
-## Learn More
+После смены `.env.local` перезапустите `npm run dev`.
 
-To learn more about Next.js, take a look at the following resources:
+## Как устроен экран
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+1. Главная страница — пагинированный список производителей со страной.
+2. **Получить инструкцию** — `POST {TD_PARSER_BASE_URL}/api/v1/instruction` с сайтом производителя. Ответ показывается на странице. Запрос может идти несколько минут.
+3. После инструкции появляется **Получить все продукты** — `POST {TD_PARSER_BASE_URL}/api/v1/parse`.
