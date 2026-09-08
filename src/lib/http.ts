@@ -14,6 +14,22 @@ export function parsePagination(
   return { offset, limit };
 }
 
+export function parseSearchName(searchParams: URLSearchParams) {
+  return (searchParams.get("name") ?? "").trim().slice(0, 100);
+}
+
+export function parseCountryId(searchParams: URLSearchParams) {
+  const value = searchParams.get("country_id")?.trim() ?? "";
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  ) {
+    return "";
+  }
+  return value;
+}
+
 export function normalizeSiteUrl(website: string) {
   const trimmed = website.trim();
   if (!trimmed) {

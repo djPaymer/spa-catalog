@@ -17,6 +17,8 @@ npm run dev
 | Переменная | Назначение | Пример |
 |------------|------------|--------|
 | `TD_CATALOG_BASE_URL` | Базовый URL td-catalog | `https://dev.toolsdiscont.com/td-catalog` |
+
+Публичный путь — `/td-catalog/api/v1/...`, сам FastAPI слушает `/api/v1/...`. Шлюз должен срезать префикс `/td-catalog`; иначе каталог отвечает 404. SPA повторяет такие запросы.
 | `TD_PARSER_BASE_URL` | Базовый URL td-parser | `http://127.0.0.1:8000` |
 
 После смены `.env.local` перезапустите `npm run dev`.

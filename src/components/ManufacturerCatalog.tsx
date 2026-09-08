@@ -1,68 +1,145 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { IconButton, PencilIcon, TrashIcon } from "@/components/Icons";
+import ManufacturerFormFields from "@/components/ManufacturerFormFields";
 import Pagination, { pageCountOf } from "@/components/Pagination";
-import type {
-  ManufacturerRow,
-  Paginated,
-  ParsedProduct,
-  ParseResult,
-  SiteInstruction,
-} from "@/lib/types";
+import {
+  emptyManufacturerFields,
+  hrefOf,
+  rememberManufacturer,
+  requestJson,
+  type ManufacturerFields,
+} from "@/lib/api";
+import type { Country, ManufacturerRow, Paginated } from "@/lib/types";
 
 const PAGE_SIZE = 20;
-const PRODUCT_PAGE_SIZE = 20;
+const SEARCH_DEBOUNCE_MS = 300;
 
-type RowState = {
-  open: boolean;
-  instructionLoading: boolean;
-  instructionError: string | null;
-  instruction: SiteInstruction | null;
-  productsLoading: boolean;
-  productsError: string | null;
-  parse: ParseResult | null;
-  productPage: number;
-};
-
-const emptyRow = (): RowState => ({
-  open: false,
-  instructionLoading: false,
-  instructionError: null,
-  instruction: null,
-  productsLoading: false,
-  productsError: null,
-  parse: null,
-  productPage: 1,
-});
-
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
-  const body = (await res.json().catch(() => ({}))) as T & { error?: string };
-  if (!res.ok) {
-    throw new Error(body.error || `Ошибка запроса ${url}`);
-  }
-  return body;
+function applyCountryNames(
+  rows: ManufacturerRow[],
+  countries: Country[],
+): ManufacturerRow[] {
+  if (!countries.length) return rows;
+  const byId = new Map(countries.map((country) => [country.id, country]));
+  return rows.map((row) => {
+    const country = byId.get(row.country_id);
+    if (!country) return row;
+    return {
+      ...row,
+      country_name: country.name,
+      country_code: country.code,
+    };
+  });
 }
 
-function hrefOf(website: string) {
-  if (!website.trim()) return null;
-  return /^https?:\/\//i.test(website) ? website : `https://${website}`;
-}
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  const needle = query.trim();
+  if (!needle) return text;
 
-function sliceProducts(products: ParsedProduct[], page: number) {
-  const start = (page - 1) * PRODUCT_PAGE_SIZE;
-  return products.slice(start, start + PRODUCT_PAGE_SIZE);
+  const parts = text.split(
+    new RegExp(`(${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi"),
+  );
+  if (parts.length === 1) return text;
+
+  return (
+    <>
+      {parts.map((part, index) =>
+        part.toLowerCase() === needle.toLowerCase() ? (
+          <mark
+            key={`${part}-${index}`}
+            className="rounded-sm bg-teal-100 px-0.5 text-teal-950"
+          >
+            {part}
+          </mark>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
 }
 
 export default function ManufacturerCatalog() {
   const [page, setPage] = useState(1);
+  const [query, setQuery] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState("");
+  const [countryId, setCountryId] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [manufacturers, setManufacturers] = useState<ManufacturerRow[]>([]);
   const [total, setTotal] = useState(0);
-  const [rows, setRows] = useState<Record<string, RowState>>({});
+  const [countries, setCountries] = useState<Country[]>([]);
+  const [countriesError, setCountriesError] = useState<string | null>(null);
+  const [countriesReload, setCountriesReload] = useState(0);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [createForm, setCreateForm] = useState<ManufacturerFields>(
+    emptyManufacturerFields(),
+  );
+  const [editing, setEditing] = useState<ManufacturerRow | null>(null);
+  const [editForm, setEditForm] = useState<ManufacturerFields>(
+    emptyManufacturerFields(),
+  );
+  const [editError, setEditError] = useState<string | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
 
   const offset = (page - 1) * PAGE_SIZE;
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadCountries() {
+      setCountriesError(null);
+      let lastError: string | null = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const nextCountries = await requestJson<Country[]>("/api/countries");
+          if (cancelled) return;
+          if (Array.isArray(nextCountries) && nextCountries.length > 0) {
+            setCountries(nextCountries);
+            setCreateForm((prev) =>
+              prev.country_id
+                ? prev
+                : { ...prev, country_id: nextCountries[0].id },
+            );
+            return;
+          }
+          lastError = "Пустой список стран";
+        } catch (err) {
+          lastError =
+            err instanceof Error ? err.message : "Не удалось загрузить страны";
+        }
+        if (cancelled) return;
+        if (attempt < 2) {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, 700 * (attempt + 1)),
+          );
+        }
+      }
+      if (!cancelled) setCountriesError(lastError);
+    }
+    void loadCountries();
+    return () => {
+      cancelled = true;
+    };
+  }, [countriesReload]);
+
+  const visibleManufacturers = useMemo(
+    () => applyCountryNames(manufacturers, countries),
+    [manufacturers, countries],
+  );
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const next = query.trim().slice(0, 100);
+      setAppliedQuery(next);
+      setPage(1);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [query]);
 
   useEffect(() => {
     let cancelled = false;
@@ -71,8 +148,14 @@ export default function ManufacturerCatalog() {
       setLoading(true);
       setError(null);
       try {
+        const params = new URLSearchParams({
+          offset: String(offset),
+          limit: String(PAGE_SIZE),
+        });
+        if (appliedQuery) params.set("name", appliedQuery);
+        if (countryId) params.set("country_id", countryId);
         const result = await requestJson<Paginated<ManufacturerRow>>(
-          `/api/manufacturers?offset=${offset}&limit=${PAGE_SIZE}`,
+          `/api/manufacturers?${params.toString()}`,
         );
         if (cancelled) return;
         setManufacturers(result.data);
@@ -86,110 +169,208 @@ export default function ManufacturerCatalog() {
       }
     }
 
-    load();
+    void load();
     return () => {
       cancelled = true;
     };
-  }, [offset]);
+  }, [offset, appliedQuery, countryId, reloadToken]);
 
-  const patchRow = useCallback((id: string, patch: Partial<RowState>) => {
-    setRows((prev) => ({
-      ...prev,
-      [id]: { ...(prev[id] ?? emptyRow()), ...patch },
-    }));
-  }, []);
-
-  const getInstruction = async (manufacturer: ManufacturerRow) => {
-    const site = hrefOf(manufacturer.website);
-    if (!site) {
-      patchRow(manufacturer.id, {
-        open: true,
-        instructionError: "У производителя нет сайта",
-      });
-      return;
-    }
-
-    patchRow(manufacturer.id, {
-      open: true,
-      instructionLoading: true,
-      instructionError: null,
-      productsError: null,
-    });
-
+  const createManufacturer = async (e: FormEvent) => {
+    e.preventDefault();
+    setCreating(true);
+    setCreateError(null);
     try {
-      const instruction = await requestJson<SiteInstruction>(
-        "/api/instruction",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: site }),
-        },
+      const created = await requestJson<ManufacturerRow>("/api/manufacturers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(createForm),
+      });
+      setCreateForm({
+        ...emptyManufacturerFields(),
+        country_id: createForm.country_id,
+      });
+      setQuery(created.name);
+      setAppliedQuery(created.name.slice(0, 100));
+      setPage(1);
+      setReloadToken((n) => n + 1);
+    } catch (err) {
+      setCreateError(
+        err instanceof Error ? err.message : "Не удалось создать производителя",
       );
-      patchRow(manufacturer.id, {
-        instructionLoading: false,
-        instruction,
-        parse: null,
-        productPage: 1,
-      });
-    } catch (e) {
-      patchRow(manufacturer.id, {
-        instructionLoading: false,
-        instructionError:
-          e instanceof Error ? e.message : "Не удалось получить инструкцию",
-      });
+    } finally {
+      setCreating(false);
     }
   };
 
-  const getProducts = async (manufacturer: ManufacturerRow) => {
-    const state = rows[manufacturer.id] ?? emptyRow();
-    const site = hrefOf(manufacturer.website);
-    if (!state.instruction || !site) return;
-
-    patchRow(manufacturer.id, {
-      productsLoading: true,
-      productsError: null,
+  const openEdit = (manufacturer: ManufacturerRow) => {
+    setEditing(manufacturer);
+    setEditError(null);
+    setEditForm({
+      name: manufacturer.name,
+      website: manufacturer.website,
+      country_id: manufacturer.country_id,
+      description: manufacturer.description ?? "",
+      address: manufacturer.address ?? "",
     });
+  };
 
+  const saveEdit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!editing) return;
+    setSavingEdit(true);
+    setEditError(null);
     try {
-      const parse = await requestJson<ParseResult>("/api/parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: site,
-          instruction: state.instruction,
-        }),
+      const updated = await requestJson<ManufacturerRow>(
+        `/api/manufacturers/${editing.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(editForm),
+        },
+      );
+      setManufacturers((rows) =>
+        rows.map((row) => (row.id === updated.id ? updated : row)),
+      );
+      setEditing(null);
+    } catch (err) {
+      setEditError(
+        err instanceof Error ? err.message : "Не удалось сохранить изменения",
+      );
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const deleteManufacturer = async (manufacturer: ManufacturerRow) => {
+    if (
+      !window.confirm(
+        `Удалить производителя «${manufacturer.name}» из td-catalog?`,
+      )
+    ) {
+      return;
+    }
+    setRemovingId(manufacturer.id);
+    setError(null);
+    try {
+      await requestJson(`/api/manufacturers/${manufacturer.id}`, {
+        method: "DELETE",
       });
-      patchRow(manufacturer.id, {
-        productsLoading: false,
-        parse,
-        productPage: 1,
-      });
-    } catch (e) {
-      patchRow(manufacturer.id, {
-        productsLoading: false,
-        productsError:
-          e instanceof Error ? e.message : "Не удалось получить продукты",
-      });
+      if (editing?.id === manufacturer.id) setEditing(null);
+      if (manufacturers.length <= 1 && page > 1) {
+        setPage(page - 1);
+      } else {
+        setReloadToken((n) => n + 1);
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Не удалось удалить производителя",
+      );
+    } finally {
+      setRemovingId(null);
     }
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6">
-      <header className="space-y-1">
-        <p className="text-xs font-medium uppercase tracking-[0.18em] text-teal-800">
-          SPA Catalog
-        </p>
-        <h1 className="text-2xl font-semibold tracking-tight text-stone-900">
-          Производители
-        </h1>
-        <p className="max-w-2xl text-sm text-stone-500">
-          Список из td-catalog. Для каждого производителя можно запросить
-          инструкцию скрейпа в td-parser, а затем собрать все продукты с его
-          сайта.
-        </p>
+    <div className="flex w-full flex-1 flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
+      <header className="space-y-4">
+        <div className="space-y-1">
+          <p className="text-xs font-medium uppercase tracking-[0.18em] text-teal-800">
+            SPA Catalog
+          </p>
+          <h1 className="text-2xl font-semibold tracking-tight text-stone-900">
+            Производители
+          </h1>
+          <p className="max-w-2xl text-sm text-stone-500">
+            Управление карточкой — в списке. Инструкция парсинга — внутри
+            производителя.
+          </p>
+        </div>
+        <div className="flex max-w-3xl flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="relative min-w-0 flex-1">
+            <label htmlFor="manufacturer-search" className="sr-only">
+              Поиск производителя
+            </label>
+            <input
+              id="manufacturer-search"
+              type="search"
+              value={query}
+              maxLength={100}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Поиск по названию"
+              className="w-full rounded-md border border-stone-300 bg-white px-3 py-2 pr-20 text-sm text-stone-900 outline-none placeholder:text-stone-400 focus:border-teal-800 focus:ring-2 focus:ring-teal-800/20"
+            />
+            {query ? (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-stone-400 hover:text-stone-700"
+              >
+                Сбросить
+              </button>
+            ) : null}
+          </div>
+          <label className="block shrink-0 text-xs sm:w-64">
+            <span className="sr-only">Страна</span>
+            <select
+              value={countryId}
+              onChange={(e) => {
+                setCountryId(e.target.value);
+                setPage(1);
+              }}
+              className="w-full rounded-md border border-stone-300 bg-white px-3 py-2 text-sm text-stone-800 outline-none focus:border-teal-800 focus:ring-2 focus:ring-teal-800/20"
+            >
+              <option value="">Все страны</option>
+              {countries.map((country) => (
+                <option key={country.id} value={country.id}>
+                  {country.name} ({country.code})
+                </option>
+              ))}
+            </select>
+            {countries.length === 0 && !countriesError ? (
+              <span className="mt-1 block text-stone-400">Загрузка стран…</span>
+            ) : null}
+            {countriesError ? (
+              <button
+                type="button"
+                onClick={() => setCountriesReload((n) => n + 1)}
+                className="mt-1 text-teal-800 underline decoration-teal-800/30 hover:text-teal-950"
+              >
+                Не удалось загрузить страны — повторить
+              </button>
+            ) : null}
+          </label>
+        </div>
+        <details className="rounded-lg border border-stone-200 bg-white p-4 shadow-sm">
+          <summary className="cursor-pointer text-sm font-medium text-stone-800">
+            Добавить производителя
+          </summary>
+          <form className="mt-4 space-y-3" onSubmit={createManufacturer}>
+            <ManufacturerFormFields
+              value={createForm}
+              onChange={setCreateForm}
+              countries={countries}
+              countriesError={countriesError}
+              disabled={creating}
+            />
+            {createError ? (
+              <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {createError}
+              </p>
+            ) : null}
+            <button
+              type="submit"
+              disabled={creating || !createForm.country_id}
+              className="rounded-md bg-teal-800 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {creating ? "Создаём…" : "Создать производителя"}
+            </button>
+          </form>
+        </details>
       </header>
 
-      {loading && <p className="text-sm text-stone-500">Загрузка производителей…</p>}
+      {loading && manufacturers.length === 0 && (
+        <p className="text-sm text-stone-500">Загрузка производителей…</p>
+      )}
 
       {error && (
         <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
@@ -198,13 +379,21 @@ export default function ManufacturerCatalog() {
       )}
 
       {!loading && !error && manufacturers.length === 0 && (
-        <p className="text-sm text-stone-500">Производители не найдены.</p>
+        <p className="text-sm text-stone-500">
+          {appliedQuery
+            ? `По запросу «${appliedQuery}» ничего не найдено.`
+            : countryId
+              ? "В этой стране производители не найдены."
+              : "Производители не найдены."}
+        </p>
       )}
 
-      {!loading && !error && manufacturers.length > 0 && (
-        <section className="space-y-4">
+      {!error && manufacturers.length > 0 && (
+        <section className={`space-y-4 ${loading ? "opacity-60" : ""}`}>
           <p className="text-sm text-stone-500">
-            Всего производителей: {total}
+            {appliedQuery
+              ? `Найдено: ${total}`
+              : `Всего производителей: ${total}`}
           </p>
           <div className="overflow-x-auto rounded-lg border border-stone-200 bg-white shadow-sm">
             <table className="w-full min-w-[720px] text-left text-sm">
@@ -213,28 +402,77 @@ export default function ManufacturerCatalog() {
                   <th className="px-4 py-3 font-medium">Производитель</th>
                   <th className="px-4 py-3 font-medium">Страна</th>
                   <th className="px-4 py-3 font-medium">Сайт</th>
-                  <th className="px-4 py-3 font-medium">Действия</th>
+                  <th className="px-4 py-3 font-medium">Управление</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
-                {manufacturers.map((manufacturer) => {
-                  const state = rows[manufacturer.id] ?? emptyRow();
+                {visibleManufacturers.map((manufacturer) => {
                   const site = hrefOf(manufacturer.website);
+                  const busy = removingId === manufacturer.id;
                   return (
-                    <ManufacturerRowView
+                    <tr
                       key={manufacturer.id}
-                      manufacturer={manufacturer}
-                      site={site}
-                      state={state}
-                      onToggle={() =>
-                        patchRow(manufacturer.id, { open: !state.open })
-                      }
-                      onInstruction={() => getInstruction(manufacturer)}
-                      onProducts={() => getProducts(manufacturer)}
-                      onProductPage={(next) =>
-                        patchRow(manufacturer.id, { productPage: next })
-                      }
-                    />
+                      className="align-middle hover:bg-stone-50/80"
+                    >
+                      <td className="px-4 py-3">
+                        <Link
+                          href={`/manufacturers/${manufacturer.id}`}
+                          onClick={() => rememberManufacturer(manufacturer)}
+                          className="font-medium text-stone-900 hover:text-teal-800 hover:underline"
+                        >
+                          <HighlightedText
+                            text={manufacturer.name}
+                            query={appliedQuery}
+                          />
+                        </Link>
+                        {manufacturer.description ? (
+                          <p className="mt-1 line-clamp-2 max-w-md text-xs text-stone-500">
+                            {manufacturer.description}
+                          </p>
+                        ) : null}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-stone-600">
+                        {manufacturer.country_name}
+                        {manufacturer.country_code ? (
+                          <span className="ml-1 text-xs text-stone-400">
+                            {manufacturer.country_code}
+                          </span>
+                        ) : null}
+                      </td>
+                      <td className="px-4 py-3">
+                        {site ? (
+                          <a
+                            href={site}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="break-all text-teal-800 underline decoration-teal-800/30 hover:text-teal-950"
+                          >
+                            {manufacturer.website}
+                          </a>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <IconButton
+                            label="Изменить"
+                            disabled={busy}
+                            onClick={() => openEdit(manufacturer)}
+                          >
+                            <PencilIcon />
+                          </IconButton>
+                          <IconButton
+                            label={busy ? "Удаляем…" : "Удалить"}
+                            tone="danger"
+                            disabled={busy}
+                            onClick={() => deleteManufacturer(manufacturer)}
+                          >
+                            <TrashIcon />
+                          </IconButton>
+                        </div>
+                      </td>
+                    </tr>
                   );
                 })}
               </tbody>
@@ -249,264 +487,61 @@ export default function ManufacturerCatalog() {
           />
         </section>
       )}
-    </div>
-  );
-}
 
-function ManufacturerRowView({
-  manufacturer,
-  site,
-  state,
-  onToggle,
-  onInstruction,
-  onProducts,
-  onProductPage,
-}: {
-  manufacturer: ManufacturerRow;
-  site: string | null;
-  state: RowState;
-  onToggle: () => void;
-  onInstruction: () => void;
-  onProducts: () => void;
-  onProductPage: (page: number) => void;
-}) {
-  const canOpenDetails =
-    state.open ||
-    state.instruction ||
-    state.instructionLoading ||
-    state.instructionError;
-
-  return (
-    <>
-      <tr className="align-top hover:bg-stone-50/80">
-        <td className="px-4 py-3">
-          <div className="font-medium text-stone-900">{manufacturer.name}</div>
-          {manufacturer.description ? (
-            <p className="mt-1 line-clamp-2 max-w-md text-xs text-stone-500">
-              {manufacturer.description}
-            </p>
-          ) : null}
-        </td>
-        <td className="whitespace-nowrap px-4 py-3 text-stone-600">
-          {manufacturer.country_name}
-          {manufacturer.country_code ? (
-            <span className="ml-1 text-xs text-stone-400">
-              {manufacturer.country_code}
-            </span>
-          ) : null}
-        </td>
-        <td className="px-4 py-3">
-          {site ? (
-            <a
-              href={site}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="break-all text-teal-800 underline decoration-teal-800/30 hover:text-teal-950"
+      {editing ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/40 p-4"
+          onClick={() => {
+            if (!savingEdit) setEditing(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-manufacturer-title"
+            className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg bg-white p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2
+              id="edit-manufacturer-title"
+              className="text-lg font-semibold text-stone-900"
             >
-              {manufacturer.website}
-            </a>
-          ) : (
-            "—"
-          )}
-        </td>
-        <td className="px-4 py-3">
-          <div className="flex flex-col items-start gap-2">
-            <button
-              type="button"
-              disabled={!site || state.instructionLoading}
-              onClick={onInstruction}
-              className="rounded-md bg-teal-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {state.instructionLoading
-                ? "Получаем инструкцию…"
-                : state.instruction
-                  ? "Обновить инструкцию"
-                  : "Получить инструкцию"}
-            </button>
-            {state.instruction ? (
-              <button
-                type="button"
-                disabled={state.productsLoading}
-                onClick={onProducts}
-                className="rounded-md border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-stone-800 hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {state.productsLoading
-                  ? "Собираем продукты…"
-                  : state.parse
-                    ? "Обновить продукты"
-                    : "Получить все продукты"}
-              </button>
-            ) : null}
-            {canOpenDetails ? (
-              <button
-                type="button"
-                onClick={onToggle}
-                className="text-xs text-stone-500 underline hover:text-stone-800"
-              >
-                {state.open ? "Скрыть детали" : "Показать детали"}
-              </button>
-            ) : null}
-          </div>
-        </td>
-      </tr>
-      {state.open ? (
-        <tr className="bg-stone-50/70">
-          <td colSpan={4} className="px-4 py-4">
-            <RowDetails
-              state={state}
-              onProductPage={onProductPage}
-            />
-          </td>
-        </tr>
-      ) : null}
-    </>
-  );
-}
-
-function RowDetails({
-  state,
-  onProductPage,
-}: {
-  state: RowState;
-  onProductPage: (page: number) => void;
-}) {
-  if (state.instructionLoading) {
-    return (
-      <p className="text-sm text-stone-600">
-        Запрос инструкции в td-parser. Это может занять несколько минут: модель
-        обходит сайт производителя.
-      </p>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {state.instructionError ? (
-        <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-          {state.instructionError}
-        </p>
-      ) : null}
-
-      {state.instruction ? (
-        <InstructionCard instruction={state.instruction} />
-      ) : !state.instructionError ? (
-        <p className="text-sm text-stone-500">Инструкция ещё не получена.</p>
-      ) : null}
-
-      {state.productsLoading ? (
-        <p className="text-sm text-stone-600">
-          Собираем продукты по инструкции. Обход каталога тоже может занять
-          несколько минут.
-        </p>
-      ) : null}
-
-      {state.productsError ? (
-        <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-          {state.productsError}
-        </p>
-      ) : null}
-
-      {state.parse ? (
-        <ProductsCard parse={state.parse} page={state.productPage} onPage={onProductPage} />
-      ) : null}
-    </div>
-  );
-}
-
-function InstructionCard({ instruction }: { instruction: SiteInstruction }) {
-  return (
-    <div className="rounded-md border border-stone-200 bg-white p-4">
-      <h2 className="text-sm font-semibold text-stone-900">Инструкция</h2>
-      <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
-        <Info label="Движок" value={instruction.engine || "html"} />
-        <Info label="Каталог" value={instruction.url || "/"} />
-        <Info label="Regex ссылок" value={instruction.links?.href || "—"} />
-        <Info label="Имя товара" value={instruction.links?.name || "text"} />
-        <Info
-          label="Пагинация"
-          value={instruction.pagination?.param ?? "нет"}
-        />
-        {instruction.links?.class ? (
-          <Info label="CSS-класс" value={instruction.links.class} />
-        ) : null}
-      </dl>
-      <details className="mt-3">
-        <summary className="cursor-pointer text-xs text-stone-500 hover:text-stone-800">
-          JSON инструкции
-        </summary>
-        <pre className="mt-2 overflow-x-auto rounded bg-stone-900 p-3 text-xs leading-5 text-stone-100">
-          {JSON.stringify(instruction, null, 2)}
-        </pre>
-      </details>
-    </div>
-  );
-}
-
-function ProductsCard({
-  parse,
-  page,
-  onPage,
-}: {
-  parse: ParseResult;
-  page: number;
-  onPage: (page: number) => void;
-}) {
-  const products = parse.products ?? [];
-  const visible = sliceProducts(products, page);
-
-  return (
-    <div className="rounded-md border border-stone-200 bg-white p-4">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-sm font-semibold text-stone-900">Продукты</h2>
-        <p className="text-xs text-stone-500">
-          {parse.total_products} шт. · {parse.pages} стр. каталога ·{" "}
-          {parse.listings} листингов
-        </p>
-      </div>
-      {products.length === 0 ? (
-        <p className="mt-3 text-sm text-stone-500">Продукты не найдены.</p>
-      ) : (
-        <div className="mt-3 space-y-3">
-          <ul className="divide-y divide-stone-100 overflow-hidden rounded-md border border-stone-100">
-            {visible.map((product) => (
-              <li
-                key={product.url}
-                className="flex flex-col gap-1 px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
-              >
-                <span className="text-sm text-stone-800">
-                  {product.name || "Без названия"}
-                </span>
-                <a
-                  href={product.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="break-all text-xs text-teal-800 underline decoration-teal-800/30 hover:text-teal-950"
+              Изменить производителя
+            </h2>
+            <form className="mt-4 space-y-3" onSubmit={saveEdit}>
+              <ManufacturerFormFields
+                value={editForm}
+                onChange={setEditForm}
+                countries={countries}
+                countriesError={countriesError}
+                disabled={savingEdit}
+              />
+              {editError ? (
+                <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                  {editError}
+                </p>
+              ) : null}
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="submit"
+                  disabled={savingEdit || !editForm.country_id}
+                  className="rounded-md bg-teal-800 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {product.url}
-                </a>
-              </li>
-            ))}
-          </ul>
-          <Pagination
-            page={page}
-            pageCount={pageCountOf(products.length, PRODUCT_PAGE_SIZE)}
-            total={products.length}
-            pageSize={PRODUCT_PAGE_SIZE}
-            onPageChange={onPage}
-          />
+                  {savingEdit ? "Сохраняем…" : "Сохранить"}
+                </button>
+                <button
+                  type="button"
+                  disabled={savingEdit}
+                  onClick={() => setEditing(null)}
+                  className="rounded-md border border-stone-300 bg-white px-3 py-1.5 text-sm font-medium text-stone-800 hover:bg-stone-50 disabled:opacity-40"
+                >
+                  Отмена
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
-      )}
-    </div>
-  );
-}
-
-function Info({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-xs uppercase tracking-wide text-stone-400">{label}</dt>
-      <dd className="mt-0.5 break-all font-mono text-xs text-stone-800">
-        {value}
-      </dd>
+      ) : null}
     </div>
   );
 }
